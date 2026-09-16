@@ -23,6 +23,7 @@ class DBHelper {
             title TEXT,
             recurrenceType INTEGER,
             isDurationDependent INTEGER,
+            parentTaskId INTEGER,
             date TEXT,
             recurrenceEndDate TEXT,
             plannedStartHour INTEGER,
@@ -64,6 +65,14 @@ class DBHelper {
     return maps.map((m) => Task.fromMap(m)).toList();
   }
 
+  // Loads a single task by its id.
+  static Future<Task?> getTaskById(int id) async {
+    final db = await getDatabase();
+    final maps = await db.query('tasks', where: 'id = ?', whereArgs: [id]);
+    if (maps.isEmpty) return null;
+    return Task.fromMap(maps.first);
+  }
+
   // Updates an existing task (used when ticking/unticking, editing, etc).
   static Future<void> updateTask(Task task) async {
     final db = await getDatabase();
@@ -79,6 +88,24 @@ class DBHelper {
   static Future<void> deleteTask(int id) async {
     final db = await getDatabase();
     await db.delete('tasks', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // Gets the direct children (sub-tasks) of a given task.
+  static Future<List<Task>> getSubTasks(int parentTaskId) async {
+    final db = await getDatabase();
+    final maps = await db.query(
+      'tasks',
+      where: 'parentTaskId = ?',
+      whereArgs: [parentTaskId],
+    );
+    return maps.map((m) => Task.fromMap(m)).toList();
+  }
+
+  // Gets only top-level tasks (no parent) — what the home screen should show.
+  static Future<List<Task>> getTopLevelTasks() async {
+    final db = await getDatabase();
+    final maps = await db.query('tasks', where: 'parentTaskId IS NULL');
+    return maps.map((m) => Task.fromMap(m)).toList();
   }
 
   // Saves or updates a completion record for a specific task and day.

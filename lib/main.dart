@@ -29,6 +29,8 @@ class TaskListScreen extends StatefulWidget {
 class _TaskListScreenState extends State<TaskListScreen> {
   List<Task> tasks = [];
   Map<int, TaskCompletion> _todayCompletions = {};
+  final Set<int> _expandedTaskIds = {};
+  final Map<int, List<Task>> _subTasksByParent = {};
 
   @override
   void initState() {
@@ -36,14 +38,45 @@ class _TaskListScreenState extends State<TaskListScreen> {
     _loadTasks();
   }
 
-  // Pulls every saved task from the database into memory, on app start.
+  // Pulls every saved top-level task from the database into memory, on app start.
   Future<void> _loadTasks() async {
-    final loaded = await DBHelper.getAllTasks();
+    final loaded = await DBHelper.getTopLevelTasks();
     final completions = await DBHelper.getCompletionsForDate(DateTime.now());
     setState(() {
       tasks = loaded;
       _todayCompletions = {for (var c in completions) c.taskId: c};
     });
+  }
+
+  // Expands a task to show its sub-tasks (loading them the first time), or collapses it.
+  Future<void> _toggleExpand(Task task) async {
+    if (_expandedTaskIds.contains(task.id)) {
+      setState(() => _expandedTaskIds.remove(task.id));
+      return;
+    }
+    final subTasks = await DBHelper.getSubTasks(task.id!);
+    setState(() {
+      _subTasksByParent[task.id!] = subTasks;
+      _expandedTaskIds.add(task.id!);
+    });
+  }
+
+  // Opens Add Task screen pre-linked to a parent, for creating a sub-task.
+  Future<void> _openAddSubTask(Task parent) async {
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (context) => AddTaskScreen(parentTaskId: parent.id),
+      ),
+    );
+    if (result != null) {
+      setState(() {
+        final list = _subTasksByParent[parent.id!] ?? [];
+        list.add(result as Task);
+        _subTasksByParent[parent.id!] = list;
+        _expandedTaskIds.add(parent.id!);
+      });
+    }
   }
 
   // Is this task ticked, specifically for today?
@@ -84,6 +117,7 @@ class _TaskListScreenState extends State<TaskListScreen> {
     setState(() {
       _todayCompletions[task.id!] = completion;
     });
+    await _updateParentStatus(task.parentTaskId);
   }
 
   // Returns true if this task applies to the given date (works for any day, not just today).
@@ -226,6 +260,7 @@ class _TaskListScreenState extends State<TaskListScreen> {
       setState(() {
         _todayCompletions[task.id!] = completion;
       });
+      await _updateParentStatus(task.parentTaskId);
     }
   }
 
@@ -239,6 +274,30 @@ class _TaskListScreenState extends State<TaskListScreen> {
     await DBHelper.saveCompletion(completion);
     setState(() {
       _todayCompletions[task.id!] = completion;
+    });
+    await _updateParentStatus(task.parentTaskId);
+  }
+
+  // After a sub-task's status changes, checks if all of its siblings are done today,
+  // and if so, auto-completes the parent too. If not, un-completes the parent (in case
+  // it was previously auto-completed and a sibling was just unticked).
+  Future<void> _updateParentStatus(int? parentTaskId) async {
+    if (parentTaskId == null) return;
+    final siblings = await DBHelper.getSubTasks(parentTaskId);
+    if (siblings.isEmpty) return;
+
+    final allDone = siblings.every(
+      (s) => _todayCompletions[s.id]?.isDone ?? false,
+    );
+    final parentCompletion = TaskCompletion(
+      taskId: parentTaskId,
+      date: DateTime.now(),
+      isDone: allDone,
+      actualEnd: allDone ? DateTime.now() : null,
+    );
+    await DBHelper.saveCompletion(parentCompletion);
+    setState(() {
+      _todayCompletions[parentTaskId] = parentCompletion;
     });
   }
 
@@ -270,8 +329,119 @@ class _TaskListScreenState extends State<TaskListScreen> {
     }
   }
 
+  // Builds one task row (used for both top-level tasks and sub-tasks), with indentation
+  // increasing per depth level so nested sub-tasks visually appear as a tree.
+  Widget _buildTaskTile(Task task, int depth) {
+    final doneToday = _isDoneToday(task);
+    final actualStartToday = _actualStartToday(task);
+    final actualEndToday = _actualEndToday(task);
+    final isExpanded = _expandedTaskIds.contains(task.id);
+    final subTasks = _subTasksByParent[task.id] ?? [];
+
+    Widget tile;
+
+    if (task.isDurationDependent) {
+      String statusText;
+      if (doneToday && actualStartToday != null && actualEndToday != null) {
+        final plannedMinutes =
+            (task.plannedEnd.hour * 60 + task.plannedEnd.minute) -
+            (task.plannedStart.hour * 60 + task.plannedStart.minute);
+        final actualMinutes = actualEndToday
+            .difference(actualStartToday)
+            .inMinutes;
+        final metDuration = actualMinutes >= plannedMinutes;
+        statusText =
+            '✓ ${TimeOfDay.fromDateTime(actualStartToday).format(context)} - '
+            '${TimeOfDay.fromDateTime(actualEndToday).format(context)}'
+            '  (${actualMinutes}min, planned ${plannedMinutes}min)'
+            '${metDuration ? '' : '  ⚠ short'}';
+      } else if (actualStartToday != null) {
+        statusText =
+            'Started at ${TimeOfDay.fromDateTime(actualStartToday).format(context)}';
+      } else {
+        statusText =
+            '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}';
+      }
+
+      tile = ListTile(
+        contentPadding: EdgeInsets.only(left: 16.0 + depth * 24, right: 16),
+        leading: IconButton(
+          icon: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right),
+          onPressed: () => _toggleExpand(task),
+        ),
+        title: Text(task.title),
+        subtitle: Text(statusText),
+        trailing: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            IconButton(
+              icon: const Icon(Icons.add, size: 20),
+              tooltip: 'Add sub-task',
+              onPressed: () => _openAddSubTask(task),
+            ),
+            doneToday
+                ? const Icon(Icons.check_circle, color: Colors.green)
+                : ElevatedButton(
+                    onPressed: actualStartToday == null
+                        ? () => _startTask(task)
+                        : () => _finishTask(task),
+                    child: Text(actualStartToday == null ? 'Start' : 'Finish'),
+                  ),
+          ],
+        ),
+      );
+    } else {
+      tile = CheckboxListTile(
+        contentPadding: EdgeInsets.only(left: 16.0 + depth * 24, right: 16),
+        secondary: IconButton(
+          icon: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right),
+          onPressed: () => _toggleExpand(task),
+        ),
+        title: Text(task.title),
+        subtitle: Text(
+          '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}'
+          '${task.isRecurring ? '  (${recurrenceLabels[task.recurrenceType]})' : ''}'
+          '${actualEndToday != null ? '  ✓ ${TimeOfDay.fromDateTime(actualEndToday).format(context)}' : ''}',
+        ),
+        value: doneToday,
+        onChanged: (value) {
+          if (value == true && !doneToday) {
+            _confirmCompletion(task);
+          } else if (value == false) {
+            _uncheckTask(task);
+          }
+        },
+      );
+    }
+
+    if (!isExpanded) return tile;
+
+    //     // When expanded, show the tile followed by each sub-task (recursively, so a sub-task
+    // can itself be expanded to reveal its own children). Each sub-task is filtered by its
+    // own date/recurrence relevance, same as top-level tasks.
+    final visibleSubTasks = subTasks.where(_isRelevantToday).toList();
+    return Column(
+      children: [
+        tile,
+        ...visibleSubTasks.map((sub) => _buildTaskTile(sub, depth + 1)),
+        Padding(
+          padding: EdgeInsets.only(left: 16.0 + (depth + 1) * 24),
+          child: Align(
+            alignment: Alignment.centerLeft,
+            child: TextButton.icon(
+              onPressed: () => _openAddSubTask(task),
+              icon: const Icon(Icons.add, size: 16),
+              label: const Text('Add sub-task'),
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    final topLevelVisible = tasks.where(_isRelevantToday).toList();
     return Scaffold(
       appBar: AppBar(
         title: const Text('My Tasks'),
@@ -283,73 +453,9 @@ class _TaskListScreenState extends State<TaskListScreen> {
         ],
       ),
       body: ListView.builder(
-        itemCount: tasks.where(_isRelevantToday).length,
-        itemBuilder: (context, index) {
-          final task = tasks.where(_isRelevantToday).toList()[index];
-          final doneToday = _isDoneToday(task);
-          final actualStartToday = _actualStartToday(task);
-          final actualEndToday = _actualEndToday(task);
-
-          if (task.isDurationDependent) {
-            // Duration-dependent: Start -> Finish flow instead of a plain tick.
-            String statusText;
-            if (doneToday &&
-                actualStartToday != null &&
-                actualEndToday != null) {
-              final plannedMinutes =
-                  (task.plannedEnd.hour * 60 + task.plannedEnd.minute) -
-                  (task.plannedStart.hour * 60 + task.plannedStart.minute);
-              final actualMinutes = actualEndToday
-                  .difference(actualStartToday)
-                  .inMinutes;
-              final metDuration = actualMinutes >= plannedMinutes;
-              statusText =
-                  '✓ ${TimeOfDay.fromDateTime(actualStartToday).format(context)} - '
-                  '${TimeOfDay.fromDateTime(actualEndToday).format(context)}'
-                  '  (${actualMinutes}min, planned ${plannedMinutes}min)'
-                  '${metDuration ? '' : '  ⚠ short'}';
-            } else if (actualStartToday != null) {
-              statusText =
-                  'Started at ${TimeOfDay.fromDateTime(actualStartToday).format(context)}';
-            } else {
-              statusText =
-                  '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}';
-            }
-
-            return ListTile(
-              title: Text(task.title),
-              subtitle: Text(statusText),
-              trailing: doneToday
-                  ? const Icon(Icons.check_circle, color: Colors.green)
-                  : ElevatedButton(
-                      onPressed: actualStartToday == null
-                          ? () => _startTask(task)
-                          : () => _finishTask(task),
-                      child: Text(
-                        actualStartToday == null ? 'Start' : 'Finish',
-                      ),
-                    ),
-            );
-          }
-
-          // Normal tasks: simple tick, unchanged behavior.
-          return CheckboxListTile(
-            title: Text(task.title),
-            subtitle: Text(
-              '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}'
-              '${task.isRecurring ? '  (Daily)' : ''}'
-              '${actualEndToday != null ? '  ✓ ${TimeOfDay.fromDateTime(actualEndToday).format(context)}' : ''}',
-            ),
-            value: doneToday,
-            onChanged: (value) {
-              if (value == true && !doneToday) {
-                _confirmCompletion(task);
-              } else if (value == false) {
-                _uncheckTask(task);
-              }
-            },
-          );
-        },
+        itemCount: topLevelVisible.length,
+        itemBuilder: (context, index) =>
+            _buildTaskTile(topLevelVisible[index], 0),
       ),
       floatingActionButton: FloatingActionButton(
         onPressed: _openAddTask,

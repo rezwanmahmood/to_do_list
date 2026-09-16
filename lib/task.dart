@@ -20,6 +20,7 @@ class Task {
   DateTime date;
   DateTime? recurrenceEndDate;
   bool isDurationDependent;
+  int? parentTaskId; // null = top-level task, otherwise the id of its parent
   TimeOfDay plannedStart;
   TimeOfDay plannedEnd;
   DateTime? actualStart;
@@ -33,6 +34,7 @@ class Task {
     required this.date,
     this.recurrenceEndDate,
     this.isDurationDependent = false,
+    this.parentTaskId,
     required this.plannedStart,
     required this.plannedEnd,
     this.actualStart,
@@ -49,6 +51,7 @@ class Task {
       'title': title,
       'recurrenceType': recurrenceType.index,
       'isDurationDependent': isDurationDependent ? 1 : 0,
+      'parentTaskId': parentTaskId,
       'date': date.toIso8601String(),
       'recurrenceEndDate': recurrenceEndDate?.toIso8601String(),
       'plannedStartHour': plannedStart.hour,
@@ -67,6 +70,7 @@ class Task {
       title: map['title'],
       recurrenceType: RecurrenceType.values[map['recurrenceType']],
       isDurationDependent: map['isDurationDependent'] == 1,
+      parentTaskId: map['parentTaskId'],
       date: DateTime.parse(map['date']),
       recurrenceEndDate: map['recurrenceEndDate'] != null
           ? DateTime.parse(map['recurrenceEndDate'])

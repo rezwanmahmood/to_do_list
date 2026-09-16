@@ -4,7 +4,9 @@ import 'task.dart';
 import 'db_helper.dart';
 
 class AddTaskScreen extends StatefulWidget {
-  const AddTaskScreen({super.key});
+  final int? parentTaskId;
+
+  const AddTaskScreen({super.key, this.parentTaskId});
 
   @override
   State<AddTaskScreen> createState() => _AddTaskScreenState();
@@ -32,6 +34,27 @@ class _AddTaskScreenState extends State<AddTaskScreen> {
   bool _isLimitedPeriod = false;
   DateTime? _recurrenceEndDate;
   bool _isDurationDependent = false;
+  bool _isReady =
+      true; // false while we're still fetching the parent's recurrence type
+
+  @override
+  void initState() {
+    super.initState();
+    if (widget.parentTaskId != null) {
+      _isReady = false;
+      _loadParentRecurrence();
+    }
+  }
+
+  // Sub-tasks must share their parent's recurrence type (daily/weekly/etc.), so fetch it
+  // and lock this screen's dropdown to match.
+  Future<void> _loadParentRecurrence() async {
+    final parent = await DBHelper.getTaskById(widget.parentTaskId!);
+    setState(() {
+      _recurrenceType = parent?.recurrenceType ?? RecurrenceType.none;
+      _isReady = true;
+    });
+  }
 
   Future<void> _pickPlannedDate() async {
     final picked = await showDatePicker(
@@ -98,6 +121,7 @@ class _AddTaskScreenState extends State<AddTaskScreen> {
       recurrenceType: _recurrenceType,
       isDurationDependent:
           _recurrenceType != RecurrenceType.none && _isDurationDependent,
+      parentTaskId: widget.parentTaskId,
       date: _plannedDate,
       recurrenceEndDate:
           _recurrenceType != RecurrenceType.none && _isLimitedPeriod
@@ -113,7 +137,9 @@ class _AddTaskScreenState extends State<AddTaskScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      appBar: AppBar(title: const Text('Add Task')),
+      appBar: AppBar(
+        title: Text(widget.parentTaskId == null ? 'Add Task' : 'Add Sub-task'),
+      ),
       body: Padding(
         padding: const EdgeInsets.all(16),
         child: Column(
@@ -142,22 +168,34 @@ class _AddTaskScreenState extends State<AddTaskScreen> {
                 ),
               ],
             ),
-            DropdownButtonFormField<RecurrenceType>(
-              initialValue: _recurrenceType,
-              decoration: const InputDecoration(labelText: 'Repeats'),
-              items: recurrenceLabels.entries
-                  .map(
-                    (e) => DropdownMenuItem(value: e.key, child: Text(e.value)),
-                  )
-                  .toList(),
-              onChanged: (val) => setState(() {
-                _recurrenceType = val ?? RecurrenceType.none;
-                if (_recurrenceType == RecurrenceType.none) {
-                  _isLimitedPeriod = false;
-                  _recurrenceEndDate = null;
-                }
-              }),
-            ),
+            if (widget.parentTaskId == null)
+              DropdownButtonFormField<RecurrenceType>(
+                initialValue: _recurrenceType,
+                decoration: const InputDecoration(labelText: 'Repeats'),
+                items: recurrenceLabels.entries
+                    .map(
+                      (e) =>
+                          DropdownMenuItem(value: e.key, child: Text(e.value)),
+                    )
+                    .toList(),
+                onChanged: (val) => setState(() {
+                  _recurrenceType = val ?? RecurrenceType.none;
+                  if (_recurrenceType == RecurrenceType.none) {
+                    _isLimitedPeriod = false;
+                    _recurrenceEndDate = null;
+                  }
+                }),
+              )
+            else
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Text(
+                  _isReady
+                      ? 'Repeats: ${recurrenceLabels[_recurrenceType]} (matches parent task)'
+                      : 'Loading parent task...',
+                  style: const TextStyle(color: Colors.grey),
+                ),
+              ),
             if (_recurrenceType != RecurrenceType.none)
               Row(
                 children: [
@@ -168,6 +206,34 @@ class _AddTaskScreenState extends State<AddTaskScreen> {
                         setState(() => _isDurationDependent = val),
                   ),
                 ],
+              ),
+            if (widget.parentTaskId == null)
+              DropdownButtonFormField<RecurrenceType>(
+                initialValue: _recurrenceType,
+                decoration: const InputDecoration(labelText: 'Repeats'),
+                items: recurrenceLabels.entries
+                    .map(
+                      (e) =>
+                          DropdownMenuItem(value: e.key, child: Text(e.value)),
+                    )
+                    .toList(),
+                onChanged: (val) => setState(() {
+                  _recurrenceType = val ?? RecurrenceType.none;
+                  if (_recurrenceType == RecurrenceType.none) {
+                    _isLimitedPeriod = false;
+                    _recurrenceEndDate = null;
+                  }
+                }),
+              )
+            else
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 12),
+                child: Text(
+                  _isReady
+                      ? 'Repeats: ${recurrenceLabels[_recurrenceType]} (matches parent task)'
+                      : 'Loading parent task...',
+                  style: const TextStyle(color: Colors.grey),
+                ),
               ),
             if (_recurrenceType != RecurrenceType.none)
               Row(

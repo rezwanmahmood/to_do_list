@@ -5,8 +5,14 @@ import 'task_completion.dart';
 import 'db_helper.dart';
 import 'day_detail_screen.dart';
 import 'add_task_screen.dart';
+import 'evaluation_screen.dart';
+import 'notification_service.dart';
 
-void main() {
+//import 'recurrence_utils.dart' show isTaskRelevantForDate;
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await NotificationService.init();
   runApp(const MyApp());
 }
 
@@ -36,6 +42,73 @@ class _TaskListScreenState extends State<TaskListScreen> {
   void initState() {
     super.initState();
     _loadTasks();
+    NotificationService.onNotificationPayload = _handleNotificationPayload;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      final pending = NotificationService.pendingLaunchPayload;
+      if (pending != null) {
+        NotificationService.pendingLaunchPayload = null;
+        _handleNotificationPayload(pending);
+      }
+    });
+  }
+
+  // Called whenever a task alarm notification is tapped (app already running,
+  // or app cold-started by tapping it). Payload format is "start:<id>" or "end:<id>".
+  Future<void> _handleNotificationPayload(String payload) async {
+    final parts = payload.split(':');
+    if (parts.length != 2) return;
+    final type = parts[0];
+    final taskId = int.tryParse(parts[1]);
+    if (taskId == null) return;
+
+    final task = await DBHelper.getTaskById(taskId);
+    if (task == null || !mounted) return;
+
+    if (type == 'start') {
+      _showAcceptRejectDialog(task);
+    } else if (type == 'end') {
+      _confirmCompletion(task);
+    }
+  }
+
+  // Shown when a task's Start/deadline alarm is tapped.
+  Future<void> _showAcceptRejectDialog(Task task) async {
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: Text(task.title),
+        content: Text(
+          task.isDurationDependent
+              ? 'Time to start this task. Accept to begin, or reject if you can\'t do it now.'
+              : 'Deadline for this task. Accept to acknowledge, or reject if you can\'t do it.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, 'reject'),
+            child: const Text('Reject'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, 'accept'),
+            child: const Text('Accept'),
+          ),
+        ],
+      ),
+    );
+
+    if (result == 'accept' && task.isDurationDependent) {
+      await _startTask(task);
+    } else if (result == 'reject') {
+      final completion = TaskCompletion(
+        taskId: task.id!,
+        date: DateTime.now(),
+        isDone: false,
+        isRejected: true,
+      );
+      await DBHelper.saveCompletion(completion);
+      setState(() {
+        _todayCompletions[task.id!] = completion;
+      });
+    }
   }
 
   // Pulls every saved top-level task from the database into memory, on app start.
@@ -46,6 +119,19 @@ class _TaskListScreenState extends State<TaskListScreen> {
       tasks = loaded;
       _todayCompletions = {for (var c in completions) c.taskId: c};
     });
+    await _rescheduleAlarms();
+  }
+
+  // Recomputes and reschedules alarms for every leaf task (a task with no sub-tasks).
+  // Called whenever tasks are loaded, added, edited, or deleted.
+  Future<void> _rescheduleAlarms() async {
+    final allTasks = await DBHelper.getAllTasks();
+    final parentIds = allTasks
+        .where((t) => t.parentTaskId != null)
+        .map((t) => t.parentTaskId!)
+        .toSet()
+        .toList();
+    await NotificationService.rescheduleAllLeafTasks(allTasks, parentIds);
   }
 
   // Expands a task to show its sub-tasks (loading them the first time), or collapses it.
@@ -76,6 +162,7 @@ class _TaskListScreenState extends State<TaskListScreen> {
         _subTasksByParent[parent.id!] = list;
         _expandedTaskIds.add(parent.id!);
       });
+      await _rescheduleAlarms();
     }
   }
 
@@ -88,6 +175,23 @@ class _TaskListScreenState extends State<TaskListScreen> {
   // What time was this task actually started today, if at all?
   DateTime? _actualStartToday(Task task) =>
       _todayCompletions[task.id]?.actualStart;
+
+  // Resets a completed duration-dependent task back to not-started, clearing its
+  // start/end times for today so it can be redone.
+  Future<void> _resetDurationTask(Task task) async {
+    final completion = TaskCompletion(
+      taskId: task.id!,
+      date: DateTime.now(),
+      isDone: false,
+      actualStart: null,
+      actualEnd: null,
+    );
+    await DBHelper.saveCompletion(completion);
+    setState(() {
+      _todayCompletions[task.id!] = completion;
+    });
+    await _updateParentStatus(task.parentTaskId);
+  }
 
   // Records the moment a duration-dependent task was actually started.
   Future<void> _startTask(Task task) async {
@@ -326,6 +430,67 @@ class _TaskListScreenState extends State<TaskListScreen> {
       setState(() {
         tasks.add(result as Task);
       });
+      await _rescheduleAlarms();
+    }
+  }
+
+  Future<void> _openEditTask(Task task) async {
+    final result = await Navigator.push(
+      context,
+      MaterialPageRoute(builder: (context) => AddTaskScreen(editingTask: task)),
+    );
+    if (result != null) {
+      final updated = result as Task;
+      setState(() {
+        if (updated.parentTaskId == null) {
+          final index = tasks.indexWhere((t) => t.id == updated.id);
+          if (index != -1) tasks[index] = updated;
+        } else {
+          final list = _subTasksByParent[updated.parentTaskId!] ?? [];
+          final index = list.indexWhere((t) => t.id == updated.id);
+          if (index != -1) list[index] = updated;
+          _subTasksByParent[updated.parentTaskId!] = list;
+        }
+      });
+      await _rescheduleAlarms();
+    }
+  }
+
+  Future<void> _deleteTask(Task task) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Delete task?'),
+        content: Text(
+          'This will permanently delete "${task.title}" and any of its sub-tasks. This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+
+    if (confirmed == true) {
+      await DBHelper.deleteTaskCascade(task.id!);
+      final parentId = task.parentTaskId;
+      setState(() {
+        tasks.removeWhere((t) => t.id == task.id);
+        _subTasksByParent.remove(task.id);
+        _expandedTaskIds.remove(task.id);
+        _todayCompletions.remove(task.id);
+        if (parentId != null) {
+          _subTasksByParent[parentId]?.removeWhere((t) => t.id == task.id);
+        }
+      });
+      await _updateParentStatus(parentId);
+      await _rescheduleAlarms();
     }
   }
 
@@ -354,13 +519,16 @@ class _TaskListScreenState extends State<TaskListScreen> {
             '✓ ${TimeOfDay.fromDateTime(actualStartToday).format(context)} - '
             '${TimeOfDay.fromDateTime(actualEndToday).format(context)}'
             '  (${actualMinutes}min, planned ${plannedMinutes}min)'
-            '${metDuration ? '' : '  ⚠ short'}';
+            '${metDuration ? '' : '  ⚠ short'}'
+            '  (${recurrenceLabels[task.recurrenceType]})';
       } else if (actualStartToday != null) {
         statusText =
-            'Started at ${TimeOfDay.fromDateTime(actualStartToday).format(context)}';
+            'Started at ${TimeOfDay.fromDateTime(actualStartToday).format(context)}'
+            '  (${recurrenceLabels[task.recurrenceType]})';
       } else {
         statusText =
-            '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}';
+            '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}'
+            '  (${recurrenceLabels[task.recurrenceType]})';
       }
 
       tile = ListTile(
@@ -374,13 +542,27 @@ class _TaskListScreenState extends State<TaskListScreen> {
         trailing: Row(
           mainAxisSize: MainAxisSize.min,
           children: [
+            PopupMenuButton<String>(
+              onSelected: (value) {
+                if (value == 'edit') _openEditTask(task);
+                if (value == 'delete') _deleteTask(task);
+              },
+              itemBuilder: (context) => const [
+                PopupMenuItem(value: 'edit', child: Text('Edit')),
+                PopupMenuItem(value: 'delete', child: Text('Delete')),
+              ],
+            ),
             IconButton(
               icon: const Icon(Icons.add, size: 20),
               tooltip: 'Add sub-task',
               onPressed: () => _openAddSubTask(task),
             ),
             doneToday
-                ? const Icon(Icons.check_circle, color: Colors.green)
+                ? IconButton(
+                    icon: const Icon(Icons.check_circle, color: Colors.green),
+                    tooltip: 'Tap to reset',
+                    onPressed: () => _resetDurationTask(task),
+                  )
                 : ElevatedButton(
                     onPressed: actualStartToday == null
                         ? () => _startTask(task)
@@ -391,26 +573,47 @@ class _TaskListScreenState extends State<TaskListScreen> {
         ),
       );
     } else {
-      tile = CheckboxListTile(
-        contentPadding: EdgeInsets.only(left: 16.0 + depth * 24, right: 16),
-        secondary: IconButton(
-          icon: Icon(isExpanded ? Icons.expand_more : Icons.chevron_right),
-          onPressed: () => _toggleExpand(task),
-        ),
-        title: Text(task.title),
-        subtitle: Text(
-          '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}'
-          '${task.isRecurring ? '  (${recurrenceLabels[task.recurrenceType]})' : ''}'
-          '${actualEndToday != null ? '  ✓ ${TimeOfDay.fromDateTime(actualEndToday).format(context)}' : ''}',
-        ),
-        value: doneToday,
-        onChanged: (value) {
-          if (value == true && !doneToday) {
-            _confirmCompletion(task);
-          } else if (value == false) {
-            _uncheckTask(task);
-          }
-        },
+      tile = Row(
+        children: [
+          Expanded(
+            child: CheckboxListTile(
+              contentPadding: EdgeInsets.only(
+                left: 16.0 + depth * 24,
+                right: 0,
+              ),
+              secondary: IconButton(
+                icon: Icon(
+                  isExpanded ? Icons.expand_more : Icons.chevron_right,
+                ),
+                onPressed: () => _toggleExpand(task),
+              ),
+              title: Text(task.title),
+              subtitle: Text(
+                '${task.plannedStart.format(context)} - ${task.plannedEnd.format(context)}'
+                '${task.isRecurring ? '  (${recurrenceLabels[task.recurrenceType]})' : ''}'
+                '${actualEndToday != null ? '  ✓ ${TimeOfDay.fromDateTime(actualEndToday).format(context)}' : ''}',
+              ),
+              value: doneToday,
+              onChanged: (value) {
+                if (value == true && !doneToday) {
+                  _confirmCompletion(task);
+                } else if (value == false) {
+                  _uncheckTask(task);
+                }
+              },
+            ),
+          ),
+          PopupMenuButton<String>(
+            onSelected: (value) {
+              if (value == 'edit') _openEditTask(task);
+              if (value == 'delete') _deleteTask(task);
+            },
+            itemBuilder: (context) => const [
+              PopupMenuItem(value: 'edit', child: Text('Edit')),
+              PopupMenuItem(value: 'delete', child: Text('Delete')),
+            ],
+          ),
+        ],
       );
     }
 
@@ -450,9 +653,29 @@ class _TaskListScreenState extends State<TaskListScreen> {
             icon: const Icon(Icons.calendar_month),
             onPressed: _openDayDetail,
           ),
+          IconButton(
+            icon: const Icon(Icons.bar_chart),
+            tooltip: 'Evaluation',
+            onPressed: () => Navigator.push(
+              context,
+              MaterialPageRoute(builder: (context) => const EvaluationScreen()),
+            ),
+          ),
+          IconButton(
+            icon: const Icon(Icons.notifications_active),
+            tooltip: 'Immediate test (temporary)',
+            onPressed: () =>
+                NotificationService.showImmediateTestNotification(),
+          ),
+          IconButton(
+            icon: const Icon(Icons.alarm),
+            tooltip: 'Scheduled test (temporary)',
+            onPressed: () => NotificationService.scheduleTestNotification(),
+          ),
         ],
       ),
       body: ListView.builder(
+        padding: const EdgeInsets.only(bottom: 80),
         itemCount: topLevelVisible.length,
         itemBuilder: (context, index) =>
             _buildTaskTile(topLevelVisible[index], 0),

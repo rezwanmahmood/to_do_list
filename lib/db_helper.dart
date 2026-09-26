@@ -84,9 +84,32 @@ class DBHelper {
     );
   }
 
+  // Updates all editable fields of an existing task (used by Edit).
+  static Future<void> updateTaskFull(Task task) async {
+    final db = await getDatabase();
+    await db.update(
+      'tasks',
+      task.toMap(),
+      where: 'id = ?',
+      whereArgs: [task.id],
+    );
+  }
+
   // Removes a task permanently.
   static Future<void> deleteTask(int id) async {
     final db = await getDatabase();
+    await db.delete('tasks', where: 'id = ?', whereArgs: [id]);
+  }
+
+  // Deletes a task, its direct sub-tasks, and all their completion records.
+  static Future<void> deleteTaskCascade(int id) async {
+    final db = await getDatabase();
+    final subTasks = await getSubTasks(id);
+    for (final sub in subTasks) {
+      await db.delete('completions', where: 'taskId = ?', whereArgs: [sub.id]);
+      await db.delete('tasks', where: 'id = ?', whereArgs: [sub.id]);
+    }
+    await db.delete('completions', where: 'taskId = ?', whereArgs: [id]);
     await db.delete('tasks', where: 'id = ?', whereArgs: [id]);
   }
 
@@ -118,9 +141,10 @@ class DBHelper {
       whereArgs: [map['taskId'], map['date']],
     );
     if (existing.isNotEmpty) {
+      final updateMap = Map<String, dynamic>.from(map)..remove('id');
       await db.update(
         'completions',
-        map,
+        updateMap,
         where: 'id = ?',
         whereArgs: [existing.first['id']],
       );
